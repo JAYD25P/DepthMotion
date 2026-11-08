@@ -38,6 +38,7 @@ class DepthMotionWidget : AppWidgetProvider() {
             if (raw == null) {
                 views.setViewVisibility(R.id.widget_image, android.view.View.GONE)
                 views.setViewVisibility(R.id.widget_empty, android.view.View.VISIBLE)
+                views.setViewVisibility(R.id.widget_motion, android.view.View.GONE)
             } else try {
                 val uri = Uri.parse(raw)
                 val source = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
@@ -46,6 +47,9 @@ class DepthMotionWidget : AppWidgetProvider() {
                     views.setImageViewBitmap(R.id.widget_image, framed)
                     views.setViewVisibility(R.id.widget_image, android.view.View.VISIBLE)
                     views.setViewVisibility(R.id.widget_empty, android.view.View.GONE)
+                    val motionOn = context.getSharedPreferences("depthmotion", Context.MODE_PRIVATE)
+                        .getBoolean("motion_enabled", false)
+                    views.setViewVisibility(R.id.widget_motion, if (motionOn) android.view.View.VISIBLE else android.view.View.GONE)
                 }
             } catch (_: Exception) { }
             manager.updateAppWidget(id, views)
