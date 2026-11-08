@@ -1,0 +1,1647 @@
+diff --git a/README.md b/README.md
+index 1ad1188..2dec552 100644
+--- a/README.md
++++ b/README.md
+@@ -1,20 +1,23 @@
+ # DepthMotion
+ 
+-DepthMotion is an Android home-screen image widget with a personal photo library, selected-folder discovery, scheduled image rotation, and parallax-style rendering.
++Android photo widget, depth viewer and live wallpaper with smooth gyroscope parallax.
+ 
+-## Current implementation
+-- Android App Widget with resizable 2x2, 4x2 and 4x4 layouts.
+-- Import individual images through the Android Photo Picker / document picker.
+-- Grant access to a selected folder tree and discover supported images recursively.
+-- Sequential or shuffled rotation.
+-- Rotation intervals supported by Android periodic background scheduling (15 minutes minimum).
+-- Image framing and parallax intensity preferences.
+-- Widget tap opens the library/settings screen.
++## Three ways to see your photos move
++- Widget: rotating photos on the home screen. Motion mode uses a foreground service. On Android 12 and newer it sends tiny margin updates instead of a new bitmap each frame.
++- Depth Viewer: full-screen, runs at display refresh rate. Swipe to change photo, double tap to switch Depth and Flat, tap to hide controls.
++- Live wallpaper: the only route to true 60 fps motion on the home screen. Double tap the wallpaper to change photo.
+ 
+-## Platform constraints
+-Android App Widgets use host-rendered RemoteViews and cannot run a continuous gyroscope/OpenGL render loop. DepthMotion therefore renders a still parallax-framed bitmap on scheduled refreshes and when the user requests refresh. A true continuously sensor-driven effect requires a foreground Activity or live wallpaper, which is intentionally not the primary product.
++## Motion engine
++- Gyroscope rate is integrated with a leak, so no drift builds up and the photo settles back to centre.
++- A critically damped spring smooths sensor jitter.
++- Accelerometer fallback for phones without a gyroscope. Idle float keeps the photo alive when the phone is still.
++- Depth style warps a mesh using an estimated depth map (centre near, brighter areas slightly nearer). Flat style slides the whole photo.
++- Shine highlight follows tilt. EXIF rotation is respected. Sensors pause while the screen is off.
++
++## Platform note
++Widgets are host-rendered RemoteViews, so launchers limit how often they redraw. The viewer and the wallpaper are not limited.
+ 
+ ## Build
+-Open the project in Android Studio or run `gradle :app:assembleDebug`. The GitHub Actions workflow builds and uploads a debug APK artifact.
++Open in Android Studio or run `gradle :app:assembleDebug`. The GitHub Actions workflow uploads a debug APK artifact.
+ 
+-Minimum SDK: 26. Target SDK: 35.
++Minimum SDK 26. Target SDK 35.
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 4d4edc8..26e8207 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -3,10 +3,20 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
++    <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false"/>
++    <uses-feature android:name="android.software.live_wallpaper" android:required="false"/>
+     <application android:theme="@style/AppTheme" android:label="DepthMotion" android:allowBackup="true">
+         <activity android:name=".SettingsActivity" android:exported="true">
+             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+         </activity>
++        <activity android:name=".DepthViewerActivity" android:exported="false"
++            android:screenOrientation="portrait"
++            android:configChanges="orientation|screenSize|keyboardHidden"/>
++        <service android:name=".DepthWallpaperService" android:exported="true" android:label="@string/app_name"
++            android:permission="android.permission.BIND_WALLPAPER">
++            <intent-filter><action android:name="android.service.wallpaper.WallpaperService"/></intent-filter>
++            <meta-data android:name="android.service.wallpaper" android:resource="@xml/depthmotion_wallpaper"/>
++        </service>
+         <service android:name=".GyroMotionService" android:exported="false" android:foregroundServiceType="specialUse">
+             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-enabled gyroscope-driven home-screen photo widget motion rendering"/>
+         </service>
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/BitmapLoader.kt b/app/src/main/java/com/jaydeep/depthmotion/BitmapLoader.kt
+new file mode 100644
+index 0000000..e712086
+--- /dev/null
++++ b/app/src/main/java/com/jaydeep/depthmotion/BitmapLoader.kt
+@@ -0,0 +1,68 @@
++package com.jaydeep.depthmotion
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.graphics.Matrix
++import android.media.ExifInterface
++import android.net.Uri
++import kotlin.math.max
++
++object BitmapLoader {
++    /** Decodes a photo near maxSide pixels, applies EXIF rotation. exactCap forces the long side to maxSide or less. */
++    fun load(context: Context, uriString: String, maxSide: Int, exactCap: Boolean = false): Bitmap? = try {
++        val uri = Uri.parse(uriString)
++        val resolver = context.contentResolver
++        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
++        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
++            null
++        } else {
++            val longSide = max(bounds.outWidth, bounds.outHeight)
++            var sample = 1
++            while (longSide / (sample * 2) >= maxSide * 0.75f) sample *= 2
++            val opts = BitmapFactory.Options().apply {
++                inSampleSize = sample
++                inPreferredConfig = Bitmap.Config.ARGB_8888
++            }
++            val decoded = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
++            if (decoded == null) null else {
++                var out = rotateByExif(context, uri, decoded)
++                val side = max(out.width, out.height)
++                if (exactCap && side > maxSide) {
++                    val k = maxSide.toFloat() / side
++                    val scaled = Bitmap.createScaledBitmap(out, (out.width * k).toInt().coerceAtLeast(1), (out.height * k).toInt().coerceAtLeast(1), true)
++                    if (scaled !== out) out.recycle()
++                    out = scaled
++                }
++                out
++            }
++        }
++    } catch (_: Throwable) {
++        null
++    }
++
++    private fun rotateByExif(context: Context, uri: Uri, src: Bitmap): Bitmap {
++        val orientation = try {
++            context.contentResolver.openInputStream(uri)?.use {
++                ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
++            } ?: ExifInterface.ORIENTATION_NORMAL
++        } catch (_: Throwable) {
++            ExifInterface.ORIENTATION_NORMAL
++        }
++        val m = Matrix()
++        when (orientation) {
++            ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
++            ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
++            ExifInterface.ORIENTATION_ROTATE_270 -> m.postRotate(270f)
++            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.postScale(-1f, 1f)
++            ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.postScale(1f, -1f)
++            ExifInterface.ORIENTATION_TRANSPOSE -> { m.postRotate(90f); m.postScale(-1f, 1f) }
++            ExifInterface.ORIENTATION_TRANSVERSE -> { m.postRotate(270f); m.postScale(-1f, 1f) }
++            else -> return src
++        }
++        val out = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
++        if (out !== src) src.recycle()
++        return out
++    }
++}
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/DepthMotionWidget.kt b/app/src/main/java/com/jaydeep/depthmotion/DepthMotionWidget.kt
+index ca984b8..e8a03f1 100644
+--- a/app/src/main/java/com/jaydeep/depthmotion/DepthMotionWidget.kt
++++ b/app/src/main/java/com/jaydeep/depthmotion/DepthMotionWidget.kt
+@@ -7,10 +7,11 @@ import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
+ import android.graphics.Bitmap
+-import android.graphics.BitmapFactory
+ import android.graphics.Canvas
+-import android.graphics.Matrix
+-import android.net.Uri
++import android.graphics.Color
++import android.os.Build
++import android.os.Bundle
++import android.view.View
+ import android.widget.RemoteViews
+ import kotlin.math.max
+ 
+@@ -18,57 +19,72 @@ class DepthMotionWidget : AppWidgetProvider() {
+     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
+         ids.forEach { update(context, manager, it) }
+     }
++
++    override fun onAppWidgetOptionsChanged(context: Context, manager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle) {
++        super.onAppWidgetOptionsChanged(context, manager, appWidgetId, newOptions)
++        update(context, manager, appWidgetId)
++    }
++
+     override fun onReceive(context: Context, intent: Intent) {
+         super.onReceive(context, intent)
+-        if (intent.action == ACTION_REFRESH) {
+-            val manager = AppWidgetManager.getInstance(context)
+-            manager.getAppWidgetIds(ComponentName(context, DepthMotionWidget::class.java)).forEach {
+-                update(context, manager, it, advance = true)
+-            }
+-        }
++        if (intent.action == ACTION_REFRESH) refreshAll(context, advance = true)
+     }
++
+     companion object {
+         const val ACTION_REFRESH = "com.jaydeep.depthmotion.REFRESH"
+-        fun update(context: Context, manager: AppWidgetManager, id: Int, advance: Boolean = false) {
+-            val raw = if (advance) PhotoStore.next(context) else PhotoStore.current(context)
++
++        /** Advances the photo once (if asked), then redraws every placed widget. */
++        fun refreshAll(context: Context, advance: Boolean = false) {
++            val manager = AppWidgetManager.getInstance(context)
++            val ids = manager.getAppWidgetIds(ComponentName(context, DepthMotionWidget::class.java))
++            if (ids.isEmpty()) return
++            if (advance) PhotoStore.next(context)
++            ids.forEach { update(context, manager, it) }
++        }
++
++        fun widgetPixels(context: Context, manager: AppWidgetManager, id: Int): Pair<Int, Int> {
++            val o = manager.getAppWidgetOptions(id)
++            val wDp = o.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH, 160).coerceAtLeast(40)
++            val hDp = o.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT, 160).coerceAtLeast(40)
++            val k = 420f / max(wDp, hDp)
++            return Pair((wDp * k).toInt().coerceAtLeast(40), (hDp * k).toInt().coerceAtLeast(40))
++        }
++
++        fun update(context: Context, manager: AppWidgetManager, id: Int) {
++            val raw = PhotoStore.current(context)
+             val views = RemoteViews(context.packageName, R.layout.widget_depthmotion)
+-            val open = PendingIntent.getActivity(context, 0, Intent(context, SettingsActivity::class.java),
+-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
++            val target = if (raw == null) SettingsActivity::class.java else DepthViewerActivity::class.java
++            val open = PendingIntent.getActivity(
++                context, 0, Intent(context, target),
++                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++            )
+             views.setOnClickPendingIntent(R.id.widget_root, open)
+-            if (raw == null) {
+-                views.setViewVisibility(R.id.widget_image, android.view.View.GONE)
+-                views.setViewVisibility(R.id.widget_empty, android.view.View.VISIBLE)
+-                views.setViewVisibility(R.id.widget_motion, android.view.View.GONE)
+-            } else try {
+-                val uri = Uri.parse(raw)
+-                val source = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+-                if (source != null) {
+-                    val framed = parallaxFrame(source)
+-                    views.setImageViewBitmap(R.id.widget_image, framed)
+-                    views.setViewVisibility(R.id.widget_image, android.view.View.VISIBLE)
+-                    views.setViewVisibility(R.id.widget_empty, android.view.View.GONE)
+-                    val motionOn = context.getSharedPreferences("depthmotion", Context.MODE_PRIVATE)
+-                        .getBoolean("motion_enabled", false)
+-                    views.setViewVisibility(R.id.widget_motion, if (motionOn) android.view.View.VISIBLE else android.view.View.GONE)
++            var shown = false
++            if (raw != null) {
++                val bmp = BitmapLoader.load(context, raw, 720, exactCap = true)
++                if (bmp != null) {
++                    val image = if (Build.VERSION.SDK_INT >= 31) bmp else neutralFrame(context, manager, id, bmp)
++                    views.setImageViewBitmap(R.id.widget_image, image)
++                    shown = true
+                 }
+-            } catch (_: Exception) { }
++            }
++            val motionOn = context.getSharedPreferences("depthmotion", Context.MODE_PRIVATE).getBoolean("motion_enabled", false)
++            views.setViewVisibility(R.id.widget_image, if (shown) View.VISIBLE else View.GONE)
++            views.setViewVisibility(R.id.widget_empty, if (shown) View.GONE else View.VISIBLE)
++            views.setViewVisibility(R.id.widget_motion, if (shown && motionOn) View.VISIBLE else View.GONE)
+             manager.updateAppWidget(id, views)
++            PhotoStore.bump(context)
+         }
+-        private fun parallaxFrame(source: Bitmap): Bitmap {
+-            val w = 900
+-            val h = 900
++
++        private fun neutralFrame(context: Context, manager: AppWidgetManager, id: Int, source: Bitmap): Bitmap {
++            val (w, h) = widgetPixels(context, manager, id)
+             val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+             val canvas = Canvas(out)
+-            val scale = max(w.toFloat()/source.width, h.toFloat()/source.height) * 1.12f
+-            val dw = source.width * scale
+-            val dh = source.height * scale
+-            val phase = (System.currentTimeMillis() / 90000L) % 4
+-            val dx = when (phase.toInt()) { 0 -> -0.025f; 1 -> 0.025f; 2 -> 0.025f; else -> -0.025f }
+-            val dy = when (phase.toInt()) { 0 -> -0.018f; 1 -> -0.018f; 2 -> 0.018f; else -> 0.018f }
+-            val left = (w-dw)/2f + w*dx
+-            val top = (h-dh)/2f + h*dy
+-            val matrix = Matrix().apply { setScale(scale, scale); postTranslate(left, top) }
+-            canvas.drawBitmap(source, matrix, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
++            canvas.drawColor(Color.BLACK)
++            val settings = RenderSettings.load(context)
++            val renderer = ParallaxRenderer()
++            renderer.draw(canvas, Photo(source), w, h, 0f, 0f, settings, 255)
++            renderer.drawOverlays(canvas, w, h, 0f, 0f, settings)
+             return out
+         }
+     }
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/DepthViewerActivity.kt b/app/src/main/java/com/jaydeep/depthmotion/DepthViewerActivity.kt
+new file mode 100644
+index 0000000..3b8d769
+--- /dev/null
++++ b/app/src/main/java/com/jaydeep/depthmotion/DepthViewerActivity.kt
+@@ -0,0 +1,163 @@
++package com.jaydeep.depthmotion
++
++import android.content.Intent
++import android.graphics.Color
++import android.graphics.drawable.GradientDrawable
++import android.os.Build
++import android.os.Bundle
++import android.view.Gravity
++import android.view.HapticFeedbackConstants
++import android.view.View
++import android.view.ViewGroup
++import android.view.WindowManager
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.TextView
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.view.WindowCompat
++import androidx.core.view.WindowInsetsCompat
++import androidx.core.view.WindowInsetsControllerCompat
++
++/** Full-screen viewer with smooth 60 fps depth parallax. Swipe to change photo, tap to hide controls. */
++class DepthViewerActivity : AppCompatActivity() {
++    private lateinit var parallax: ParallaxView
++    private lateinit var hud: LinearLayout
++    private lateinit var counter: TextView
++    private lateinit var styleChip: TextView
++    private lateinit var shineChip: TextView
++    private var hudShown = true
++    private var changed = false
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        WindowCompat.setDecorFitsSystemWindows(window, false)
++        if (Build.VERSION.SDK_INT >= 28) {
++            window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
++        }
++        WindowInsetsControllerCompat(window, window.decorView).apply {
++            hide(WindowInsetsCompat.Type.systemBars())
++            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
++        }
++        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++
++        val root = FrameLayout(this)
++        parallax = ParallaxView(this)
++        root.addView(parallax, FrameLayout.LayoutParams(-1, -1))
++
++        counter = TextView(this).apply {
++            setTextColor(Color.WHITE)
++            textSize = 13f
++            setPadding(dp(14), dp(7), dp(14), dp(7))
++            background = pill()
++        }
++        root.addView(counter, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
++            setMargins(dp(16), dp(40), 0, 0)
++        })
++
++        hud = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++            gravity = Gravity.CENTER
++            setPadding(dp(12), dp(8), dp(12), dp(36))
++        }
++        styleChip = chip("") { toggleStyle() }
++        shineChip = chip("") { toggleShine() }
++        hud.addView(styleChip)
++        hud.addView(shineChip)
++        hud.addView(chip("⚙  Settings") { startActivity(Intent(this, SettingsActivity::class.java)) })
++        hud.addView(chip("✕  Close") { finish() })
++        root.addView(hud, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
++        setContentView(root)
++
++        parallax.onSwipe = { dir -> go(dir) }
++        parallax.onTap = { toggleHud() }
++        parallax.onDoubleTap = { toggleStyle() }
++        parallax.showPhoto(PhotoStore.current(this))
++        refreshHud()
++    }
++
++    override fun onResume() {
++        super.onResume()
++        parallax.applySettings()
++        refreshHud()
++        parallax.resume()
++    }
++
++    override fun onPause() {
++        parallax.pause()
++        super.onPause()
++    }
++
++    override fun onStop() {
++        if (changed) {
++            changed = false
++            DepthMotionWidget.refreshAll(this)
++        }
++        super.onStop()
++    }
++
++    override fun onDestroy() {
++        parallax.release()
++        super.onDestroy()
++    }
++
++    private fun go(dir: Int) {
++        val uri = PhotoStore.step(this, dir) ?: return
++        parallax.showPhoto(uri)
++        changed = true
++        parallax.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
++        refreshHud()
++    }
++
++    private fun toggleStyle() {
++        val p = getSharedPreferences("depthmotion", 0)
++        val depth = p.getInt("style", RenderSettings.STYLE_DEPTH) == RenderSettings.STYLE_DEPTH
++        p.edit().putInt("style", if (depth) RenderSettings.STYLE_FLAT else RenderSettings.STYLE_DEPTH).apply()
++        parallax.applySettings()
++        parallax.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
++        refreshHud()
++    }
++
++    private fun toggleShine() {
++        val p = getSharedPreferences("depthmotion", 0)
++        p.edit().putBoolean("shine", !p.getBoolean("shine", true)).apply()
++        parallax.applySettings()
++        refreshHud()
++    }
++
++    private fun toggleHud() {
++        hudShown = !hudShown
++        val a = if (hudShown) 1f else 0f
++        hud.animate().alpha(a).setDuration(180).start()
++        counter.animate().alpha(a).setDuration(180).start()
++        hud.visibility = View.VISIBLE
++    }
++
++    private fun refreshHud() {
++        val (pos, total) = PhotoStore.position(this)
++        counter.text = if (total == 0) "No photos yet" else "$pos / $total"
++        val p = getSharedPreferences("depthmotion", 0)
++        styleChip.text = if (p.getInt("style", RenderSettings.STYLE_DEPTH) == RenderSettings.STYLE_DEPTH) "◈  Depth" else "◇  Flat"
++        shineChip.text = if (p.getBoolean("shine", true)) "✦  Shine on" else "✦  Shine off"
++    }
++
++    private fun chip(label: String, action: () -> Unit) = TextView(this).apply {
++        text = label
++        textSize = 13f
++        setTextColor(Color.WHITE)
++        gravity = Gravity.CENTER
++        setPadding(dp(14), dp(10), dp(14), dp(10))
++        background = pill()
++        isClickable = true
++        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
++            setMargins(dp(4), 0, dp(4), 0)
++        }
++        setOnClickListener { action() }
++    }
++
++    private fun pill() = GradientDrawable().apply {
++        setColor(Color.argb(120, 12, 10, 24))
++        cornerRadius = dp(22).toFloat()
++    }
++
++    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
++}
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/DepthWallpaperService.kt b/app/src/main/java/com/jaydeep/depthmotion/DepthWallpaperService.kt
+new file mode 100644
+index 0000000..e02e3e0
+--- /dev/null
++++ b/app/src/main/java/com/jaydeep/depthmotion/DepthWallpaperService.kt
+@@ -0,0 +1,146 @@
++package com.jaydeep.depthmotion
++
++import android.app.WallpaperManager
++import android.graphics.Canvas
++import android.graphics.Color
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.os.SystemClock
++import android.service.wallpaper.WallpaperService
++import android.view.Choreographer
++import android.view.SurfaceHolder
++import java.util.concurrent.Executors
++import kotlin.math.min
++
++/** Live wallpaper: the only way to get a true 60 fps gyro render on the home screen. */
++class DepthWallpaperService : WallpaperService() {
++    override fun onCreateEngine(): Engine = DepthEngine()
++
++    inner class DepthEngine : WallpaperService.Engine(), Choreographer.FrameCallback {
++        private val tilt = TiltSensor(this@DepthWallpaperService)
++        private val renderer = ParallaxRenderer()
++        private val loader = Executors.newSingleThreadExecutor()
++        private val main = Handler(Looper.getMainLooper())
++        private var settings = RenderSettings.load(this@DepthWallpaperService)
++        private var photo: Photo? = null
++        private var prev: Photo? = null
++        private var fade = 1f
++        private var visible = false
++        private var width = 0
++        private var height = 0
++        private var lastNanos = 0L
++        private var loadedVersion = -1
++        private var lastTap = 0L
++
++        override fun onCreate(surfaceHolder: SurfaceHolder) {
++            super.onCreate(surfaceHolder)
++            loadCurrent()
++        }
++
++        override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
++            super.onSurfaceChanged(holder, format, w, h)
++            width = w
++            height = h
++            tilt.refreshRotation()
++        }
++
++        override fun onVisibilityChanged(isVisible: Boolean) {
++            visible = isVisible
++            val choreographer = Choreographer.getInstance()
++            if (isVisible) {
++                settings = RenderSettings.load(this@DepthWallpaperService)
++                tilt.idleFloat = settings.idleFloat
++                if (PhotoStore.version(this@DepthWallpaperService) != loadedVersion) loadCurrent()
++                lastNanos = 0L
++                tilt.start()
++                choreographer.removeFrameCallback(this)
++                choreographer.postFrameCallback(this)
++            } else {
++                tilt.stop()
++                choreographer.removeFrameCallback(this)
++            }
++        }
++
++        override fun onSurfaceDestroyed(holder: SurfaceHolder) {
++            visible = false
++            tilt.stop()
++            Choreographer.getInstance().removeFrameCallback(this)
++            super.onSurfaceDestroyed(holder)
++        }
++
++        override fun onDestroy() {
++            visible = false
++            tilt.stop()
++            Choreographer.getInstance().removeFrameCallback(this)
++            loader.shutdownNow()
++            super.onDestroy()
++        }
++
++        override fun onCommand(action: String?, x: Int, y: Int, z: Int, extras: Bundle?, resultRequested: Boolean): Bundle? {
++            if (action == WallpaperManager.COMMAND_TAP) {
++                val now = SystemClock.uptimeMillis()
++                if (now - lastTap < 450L) {
++                    PhotoStore.step(this@DepthWallpaperService, 1)
++                    loadCurrent()
++                    lastTap = 0L
++                } else lastTap = now
++            }
++            return super.onCommand(action, x, y, z, extras, resultRequested)
++        }
++
++        private fun loadCurrent() {
++            val version = PhotoStore.version(this@DepthWallpaperService)
++            val uri = PhotoStore.current(this@DepthWallpaperService)
++            loadedVersion = version
++            if (uri == null) return
++            loader.execute {
++                val bmp = BitmapLoader.load(this@DepthWallpaperService, uri, 2048)
++                val p = bmp?.let { Photo(it) }
++                main.post {
++                    if (p != null) {
++                        prev = photo
++                        photo = p
++                        fade = if (prev == null) 1f else 0f
++                    }
++                }
++            }
++        }
++
++        override fun doFrame(frameTimeNanos: Long) {
++            if (!visible) return
++            val dt = if (lastNanos == 0L) 0.016f else (frameTimeNanos - lastNanos) / 1e9f
++            lastNanos = frameTimeNanos
++            tilt.step(dt)
++            if (fade < 1f) {
++                fade = min(1f, fade + dt / 0.6f)
++                if (fade >= 1f) prev = null
++            }
++            drawFrame()
++            Choreographer.getInstance().postFrameCallback(this)
++        }
++
++        private fun drawFrame() {
++            val holder = surfaceHolder
++            var canvas: Canvas? = null
++            try {
++                canvas = holder.lockHardwareCanvas()
++                if (canvas == null) return
++                val w = canvas.width
++                val h = canvas.height
++                canvas.drawColor(Color.rgb(17, 16, 27))
++                val cur = photo ?: return
++                val old = prev
++                if (old != null && fade < 1f) renderer.draw(canvas, old, w, h, tilt.x, tilt.y, settings, 255)
++                val eased = fade * fade * (3f - 2f * fade)
++                renderer.draw(canvas, cur, w, h, tilt.x, tilt.y, settings, (255 * eased).toInt())
++                renderer.drawOverlays(canvas, w, h, tilt.x, tilt.y, settings)
++            } catch (_: Throwable) {
++            } finally {
++                if (canvas != null) {
++                    try { holder.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/GyroMotionService.kt b/app/src/main/java/com/jaydeep/depthmotion/GyroMotionService.kt
+index 262c7e4..e156cb3 100644
+--- a/app/src/main/java/com/jaydeep/depthmotion/GyroMotionService.kt
++++ b/app/src/main/java/com/jaydeep/depthmotion/GyroMotionService.kt
+@@ -9,166 +9,201 @@ import android.appwidget.AppWidgetManager
+ import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
++import android.content.pm.ServiceInfo
+ import android.graphics.Bitmap
+-import android.graphics.BitmapFactory
+ import android.graphics.Canvas
+-import android.graphics.Matrix
+-import android.hardware.Sensor
+-import android.hardware.SensorEvent
+-import android.hardware.SensorEventListener
+-import android.hardware.SensorManager
++import android.graphics.Color
+ import android.os.Build
++import android.os.Handler
+ import android.os.IBinder
+-import android.content.pm.ServiceInfo
++import android.os.Looper
++import android.os.PowerManager
++import android.util.TypedValue
+ import android.widget.RemoteViews
+-import kotlin.math.max
+-
+-class GyroMotionService : Service(), SensorEventListener {
+-    private lateinit var sensorManager: SensorManager
+-    private var orientationSensor: Sensor? = null
+-    private var sourceBitmap: Bitmap? = null
+-    private var lastFrame = 0L
+-    private var lastSensorTimestamp = 0L
+-    private var loadedUri: String? = null
+-    private var roll = 0f
+-    private var pitch = 0f
++import androidx.annotation.RequiresApi
++import java.util.concurrent.Executors
++import kotlin.math.abs
++
++/**
++ * Drives the home-screen widget. On Android 12+ it sends tiny margin updates (a few numbers)
++ * instead of a new bitmap each frame, which is far lighter than before. Older versions get small
++ * rendered frames. Sensors pause while the screen is off.
++ */
++class GyroMotionService : Service() {
++    private lateinit var tilt: TiltSensor
++    private lateinit var power: PowerManager
++    private val handler = Handler(Looper.getMainLooper())
++    private val worker = Executors.newSingleThreadExecutor()
++    private val renderer = ParallaxRenderer()
++    private val frames = HashMap<Int, Bitmap>()
++    private var settings = RenderSettings()
++    private var photo: Photo? = null
++    private var loadedVersion = -1
++    private var seenVersion = -1
++    private var loading = false
++    private var sensing = false
++    private var lastNs = 0L
++    private var lastShiftX = Float.NaN
++    private var lastShiftY = Float.NaN
++    private var useBitmapPath = Build.VERSION.SDK_INT < 31
++
++    private val ticker = Runnable { tick() }
+ 
+     override fun onCreate() {
+         super.onCreate()
+         createChannel()
+-        val stop = PendingIntent.getService(this, 9,
+-            Intent(this, GyroMotionService::class.java).setAction(ACTION_STOP),
+-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+-        val notification = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL)
++        val stop = PendingIntent.getService(
++            this, 9, Intent(this, GyroMotionService::class.java).setAction(ACTION_STOP),
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++        )
++        val notification = Notification.Builder(this, CHANNEL)
+             .setSmallIcon(android.R.drawable.ic_menu_compass)
+             .setContentTitle("DepthMotion is active")
+             .setContentText("Gyroscope parallax is moving your home-screen photo")
+             .setOngoing(true)
+             .addAction(android.R.drawable.ic_media_pause, "Stop motion", stop)
+             .build()
+-        else Notification.Builder(this)
+-            .setSmallIcon(android.R.drawable.ic_menu_compass)
+-            .setContentTitle("DepthMotion is active")
+-            .setContentText("Gyroscope parallax is enabled")
+-            .setOngoing(true).build()
+         if (Build.VERSION.SDK_INT >= 34) {
+             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+         } else startForeground(NOTIFICATION_ID, notification)
+ 
+-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+-        orientationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+-            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+-            ?: sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+-        orientationSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+-        loadPhoto()
++        power = getSystemService(Context.POWER_SERVICE) as PowerManager
++        tilt = TiltSensor(this)
++        settings = RenderSettings.load(this)
++        tilt.idleFloat = settings.idleFloat
++        handler.post(ticker)
+     }
+ 
+-    private fun loadPhoto() {
+-        val raw = PhotoStore.current(this)
+-        if (raw == loadedUri && sourceBitmap != null) return
+-        sourceBitmap?.recycle()
+-        loadedUri = raw
+-        sourceBitmap = try {
+-            raw?.let { uri ->
+-                contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { BitmapFactory.decodeStream(it) }
++    private fun tick() {
++        var next = FRAME_MS
++        if (!power.isInteractive) {
++            if (sensing) { tilt.stop(); sensing = false }
++            next = 1000L
++        } else {
++            if (!sensing) {
++                settings = RenderSettings.load(this)
++                tilt.idleFloat = settings.idleFloat
++                tilt.start()
++                sensing = true
++                lastNs = 0L
+             }
+-        } catch (_: Exception) { null }
++            val now = System.nanoTime()
++            val dt = if (lastNs == 0L) 0.05f else (now - lastNs) / 1e9f
++            lastNs = now
++            tilt.step(dt)
++            val v = PhotoStore.version(this)
++            if (v != seenVersion) { seenVersion = v; lastShiftX = Float.NaN }
++            pushFrame()
++            if (useBitmapPath) next = BITMAP_FRAME_MS
++        }
++        handler.postDelayed(ticker, next)
+     }
+ 
+-    override fun onSensorChanged(event: SensorEvent) {
+-        if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
+-            if (lastSensorTimestamp != 0L) {
+-                val dt = (event.timestamp - lastSensorTimestamp) / 1_000_000_000f
+-                roll = (roll + event.values[1] * dt * 0.85f).coerceIn(-1f, 1f)
+-                pitch = (pitch + event.values[0] * dt * 0.85f).coerceIn(-1f, 1f)
++    private fun pushFrame() {
++        val manager = AppWidgetManager.getInstance(this)
++        val ids = manager.getAppWidgetIds(ComponentName(this, DepthMotionWidget::class.java))
++        if (ids.isEmpty()) return
++        if (!useBitmapPath && Build.VERSION.SDK_INT >= 31) {
++            val dir = if (settings.invert) -1f else 1f
++            val sx = (tilt.x * dir * SHIFT_DP * settings.sensitivity).coerceIn(-MARGIN_DP, MARGIN_DP)
++            val sy = (tilt.y * dir * SHIFT_DP * settings.sensitivity).coerceIn(-MARGIN_DP, MARGIN_DP)
++            if (!lastShiftX.isNaN() && abs(sx - lastShiftX) < 0.35f && abs(sy - lastShiftY) < 0.35f) return
++            lastShiftX = sx
++            lastShiftY = sy
++            try {
++                ids.forEach { pushShift(manager, it, sx, sy) }
++            } catch (_: Throwable) {
++                useBitmapPath = true
+             }
+-            lastSensorTimestamp = event.timestamp
+         } else {
+-            val matrix = FloatArray(9)
+-            val angles = FloatArray(3)
+-            SensorManager.getRotationMatrixFromVector(matrix, event.values)
+-            SensorManager.getOrientation(matrix, angles)
+-            // Fused game rotation vector avoids unbounded gyro drift on supported phones.
+-            roll = (angles[2] / 0.55f).coerceIn(-1f, 1f)
+-            pitch = (angles[1] / 0.55f).coerceIn(-1f, 1f)
+-            lastSensorTimestamp = event.timestamp
+-        }
+-        val now = System.currentTimeMillis()
+-        if (now - lastFrame >= 350L) {
+-            lastFrame = now
+-            renderWidget()
++            renderBitmaps(manager, ids)
+         }
+     }
+ 
+-    private fun renderWidget() {
+-        loadPhoto()
+-        val source = sourceBitmap ?: return
+-        val width = 560
+-        val height = 560
+-        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+-        val canvas = Canvas(output)
+-        val scale = max(width.toFloat() / source.width, height.toFloat() / source.height) * 1.14f
+-        val sensitivity = getSharedPreferences("depthmotion", 0).getInt("sensitivity", 55).coerceIn(10, 100) / 55f
+-        val dx = roll * width * 0.035f * sensitivity
+-        val dy = pitch * height * 0.035f * sensitivity
+-        val matrix = Matrix().apply {
+-            setScale(scale, scale)
+-            postTranslate((width - source.width * scale) / 2f + dx,
+-                (height - source.height * scale) / 2f + dy)
+-        }
+-        canvas.drawBitmap(source, matrix, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+-        val manager = AppWidgetManager.getInstance(this)
+-        val ids = manager.getAppWidgetIds(ComponentName(this, DepthMotionWidget::class.java))
++    @RequiresApi(31)
++    private fun pushShift(manager: AppWidgetManager, id: Int, sx: Float, sy: Float) {
++        val v = RemoteViews(packageName, R.layout.widget_depthmotion)
++        val unit = TypedValue.COMPLEX_UNIT_DIP
++        v.setViewLayoutMargin(R.id.widget_image, RemoteViews.MARGIN_LEFT, -MARGIN_DP + sx, unit)
++        v.setViewLayoutMargin(R.id.widget_image, RemoteViews.MARGIN_RIGHT, -MARGIN_DP - sx, unit)
++        v.setViewLayoutMargin(R.id.widget_image, RemoteViews.MARGIN_TOP, -MARGIN_DP + sy, unit)
++        v.setViewLayoutMargin(R.id.widget_image, RemoteViews.MARGIN_BOTTOM, -MARGIN_DP - sy, unit)
++        manager.partiallyUpdateAppWidget(id, v)
++    }
++
++    private fun renderBitmaps(manager: AppWidgetManager, ids: IntArray) {
++        ensurePhoto()
++        val p = photo ?: return
+         ids.forEach { id ->
+-            val views = RemoteViews(packageName, R.layout.widget_depthmotion)
+-            val open = PendingIntent.getActivity(this, id, Intent(this, SettingsActivity::class.java),
+-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+-            views.setOnClickPendingIntent(R.id.widget_root, open)
+-            views.setImageViewBitmap(R.id.widget_image, output)
+-            views.setViewVisibility(R.id.widget_image, android.view.View.VISIBLE)
+-            views.setViewVisibility(R.id.widget_empty, android.view.View.GONE)
+-            views.setViewVisibility(R.id.widget_motion, android.view.View.VISIBLE)
+-            manager.updateAppWidget(id, views)
++            val (w, h) = DepthMotionWidget.widgetPixels(this, manager, id)
++            val bmp = frames[id]?.takeIf { it.width == w && it.height == h }
++                ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { frames[id] = it }
++            val canvas = Canvas(bmp)
++            canvas.drawColor(Color.BLACK)
++            renderer.draw(canvas, p, w, h, tilt.x, tilt.y, settings, 255)
++            renderer.drawOverlays(canvas, w, h, tilt.x, tilt.y, settings)
++            val v = RemoteViews(packageName, R.layout.widget_depthmotion)
++            v.setImageViewBitmap(R.id.widget_image, bmp)
++            manager.partiallyUpdateAppWidget(id, v)
++        }
++    }
++
++    private fun ensurePhoto() {
++        val version = PhotoStore.version(this)
++        if (version == loadedVersion || loading) return
++        loading = true
++        worker.execute {
++            val raw = PhotoStore.current(this)
++            val bmp = raw?.let { BitmapLoader.load(this, it, 720, exactCap = true) }
++            val ph = bmp?.let { Photo(it) }
++            handler.post {
++                loadedVersion = version
++                photo = ph
++                loading = false
++            }
+         }
+-        output.recycle()
+     }
+ 
+-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+         if (intent?.action == ACTION_STOP) {
++            getSharedPreferences("depthmotion", 0).edit().putBoolean("motion_enabled", false).apply()
+             stopSelf()
+             return START_NOT_STICKY
+         }
+         return START_STICKY
+     }
++
+     override fun onDestroy() {
+-        sensorManager.unregisterListener(this)
+-        sourceBitmap?.recycle()
+-        sourceBitmap = null
+-        loadedUri = null
++        handler.removeCallbacks(ticker)
++        tilt.stop()
++        worker.shutdownNow()
++        frames.clear()
+         getSharedPreferences("depthmotion", 0).edit().putBoolean("motion_enabled", false).apply()
+-        val manager = AppWidgetManager.getInstance(this)
+-        manager.getAppWidgetIds(ComponentName(this, DepthMotionWidget::class.java)).forEach {
+-            DepthMotionWidget.update(this, manager, it)
+-        }
++        DepthMotionWidget.refreshAll(this)
+         super.onDestroy()
+     }
++
+     override fun onBind(intent: Intent?): IBinder? = null
+ 
+     private fun createChannel() {
+-        if (Build.VERSION.SDK_INT >= 26) {
+-            val manager = getSystemService(NotificationManager::class.java)
+-            manager.createNotificationChannel(NotificationChannel(CHANNEL, "DepthMotion motion", NotificationManager.IMPORTANCE_LOW))
+-        }
++        val manager = getSystemService(NotificationManager::class.java)
++        manager.createNotificationChannel(NotificationChannel(CHANNEL, "DepthMotion motion", NotificationManager.IMPORTANCE_LOW))
+     }
++
+     companion object {
+         private const val CHANNEL = "depthmotion_motion"
+         private const val NOTIFICATION_ID = 41
++        private const val FRAME_MS = 50L
++        private const val BITMAP_FRAME_MS = 150L
++        private const val MARGIN_DP = 12f
++        private const val SHIFT_DP = 6.5f
+         const val ACTION_STOP = "com.jaydeep.depthmotion.STOP_MOTION"
++
+         fun start(context: Context) {
+-            context.startForegroundService(Intent(context, GyroMotionService::class.java))
+             context.getSharedPreferences("depthmotion", 0).edit().putBoolean("motion_enabled", true).apply()
++            context.startForegroundService(Intent(context, GyroMotionService::class.java))
+         }
++
+         fun stop(context: Context) {
+             context.stopService(Intent(context, GyroMotionService::class.java))
+             context.getSharedPreferences("depthmotion", 0).edit().putBoolean("motion_enabled", false).apply()
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/ParallaxRenderer.kt b/app/src/main/java/com/jaydeep/depthmotion/ParallaxRenderer.kt
+new file mode 100644
+index 0000000..b329cae
+--- /dev/null
++++ b/app/src/main/java/com/jaydeep/depthmotion/ParallaxRenderer.kt
+@@ -0,0 +1,171 @@
++package com.jaydeep.depthmotion
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Matrix
++import android.graphics.Paint
++import android.graphics.RadialGradient
++import android.graphics.Shader
++import kotlin.math.max
++import kotlin.math.min
++import kotlin.math.sqrt
++
++class RenderSettings(
++    var sensitivity: Float = 1f,
++    var style: Int = STYLE_DEPTH,
++    var shine: Boolean = true,
++    var invert: Boolean = false,
++    var idleFloat: Boolean = true
++) {
++    companion object {
++        const val STYLE_FLAT = 0
++        const val STYLE_DEPTH = 1
++        fun load(context: Context): RenderSettings {
++            val p = context.getSharedPreferences("depthmotion", Context.MODE_PRIVATE)
++            return RenderSettings(
++                sensitivity = p.getInt("sensitivity", 55).coerceIn(10, 100) / 55f,
++                style = p.getInt("style", STYLE_DEPTH),
++                shine = p.getBoolean("shine", true),
++                invert = p.getBoolean("invert", false),
++                idleFloat = p.getBoolean("float", true)
++            )
++        }
++    }
++}
++
++/** A decoded photo plus an estimated depth grid used for the 3D warp. */
++class Photo(val bitmap: Bitmap) {
++    val depth: FloatArray = DepthField.build(bitmap)
++}
++
++/** Estimates depth: centre of the frame reads as near, brighter areas read slightly nearer. */
++object DepthField {
++    const val COLS = 24
++    const val ROWS = 32
++
++    fun build(src: Bitmap): FloatArray {
++        val w = COLS + 1
++        val h = ROWS + 1
++        val small = Bitmap.createScaledBitmap(src, w, h, true)
++        val px = IntArray(w * h)
++        small.getPixels(px, 0, w, 0, 0, w, h)
++        if (small !== src) small.recycle()
++        var lum = FloatArray(w * h) { i ->
++            val c = px[i]
++            (0.299f * Color.red(c) + 0.587f * Color.green(c) + 0.114f * Color.blue(c)) / 255f
++        }
++        repeat(2) { lum = blur(lum, w, h) }
++        var mn = Float.MAX_VALUE
++        var mx = -Float.MAX_VALUE
++        for (v in lum) { mn = min(mn, v); mx = max(mx, v) }
++        val range = max(mx - mn, 0.05f)
++        val d = FloatArray(w * h)
++        for (y in 0 until h) for (x in 0 until w) {
++            val l = (lum[y * w + x] - mn) / range
++            val cx = x / (w - 1f) * 2f - 1f
++            val cy = y / (h - 1f) * 2f - 1f
++            val center = 1f - min(1f, sqrt(cx * cx * 0.8f + cy * cy * 0.6f))
++            d[y * w + x] = 0.3f * l + 0.7f * center
++        }
++        var dmn = Float.MAX_VALUE
++        var dmx = -Float.MAX_VALUE
++        for (v in d) { dmn = min(dmn, v); dmx = max(dmx, v) }
++        val dr = max(dmx - dmn, 1e-3f)
++        for (i in d.indices) d[i] = (d[i] - dmn) / dr * 2f - 1f
++        return d
++    }
++
++    private fun blur(a: FloatArray, w: Int, h: Int): FloatArray {
++        val out = FloatArray(a.size)
++        for (y in 0 until h) for (x in 0 until w) {
++            var s = 0f
++            var n = 0
++            for (dy in -1..1) for (dx in -1..1) {
++                val xx = x + dx
++                val yy = y + dy
++                if (xx in 0 until w && yy in 0 until h) { s += a[yy * w + xx]; n++ }
++            }
++            out[y * w + x] = s / n
++        }
++        return out
++    }
++}
++
++class ParallaxRenderer {
++    private val cols = DepthField.COLS
++    private val rows = DepthField.ROWS
++    private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
++    private val verts = FloatArray((cols + 1) * (rows + 1) * 2)
++    private val matrix = Matrix()
++    private val shineMatrix = Matrix()
++    private val shinePaint = Paint()
++    private val vignettePaint = Paint()
++    private var shineShader: RadialGradient? = null
++    private var lastW = 0
++    private var lastH = 0
++
++    fun draw(canvas: Canvas, photo: Photo, w: Int, h: Int, tx: Float, ty: Float, s: RenderSettings, alpha: Int) {
++        val bmp = photo.bitmap
++        if (bmp.isRecycled || w <= 0 || h <= 0) return
++        val dir = if (s.invert) -1f else 1f
++        val nx = tx * dir
++        val ny = ty * dir
++        val f = 0.035f * s.sensitivity
++        val maxX = f * w
++        val maxY = f * h
++        val zoom = 1f + 2f * f + 0.012f
++        val scale = max(w / bmp.width.toFloat(), h / bmp.height.toFloat()) * zoom
++        val dw = bmp.width * scale
++        val dh = bmp.height * scale
++        val left = (w - dw) / 2f
++        val top = (h - dh) / 2f
++        paint.alpha = alpha.coerceIn(0, 255)
++        if (s.style == RenderSettings.STYLE_DEPTH) {
++            var k = 0
++            for (j in 0..rows) for (i in 0..cols) {
++                val d = photo.depth[j * (cols + 1) + i]
++                val factor = 0.55f + 0.45f * d
++                verts[k++] = left + dw * i / cols + nx * maxX * factor
++                verts[k++] = top + dh * j / rows + ny * maxY * factor
++            }
++            canvas.drawBitmapMesh(bmp, cols, rows, verts, 0, null, 0, paint)
++        } else {
++            matrix.reset()
++            matrix.setScale(scale, scale)
++            matrix.postTranslate(left + nx * maxX, top + ny * maxY)
++            canvas.drawBitmap(bmp, matrix, paint)
++        }
++    }
++
++    fun drawOverlays(canvas: Canvas, w: Int, h: Int, tx: Float, ty: Float, s: RenderSettings) {
++        ensureOverlays(w, h)
++        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), vignettePaint)
++        if (s.shine) {
++            val dir = if (s.invert) -1f else 1f
++            shineMatrix.setTranslate(w * (0.5f - 0.55f * tx * dir), h * (0.32f - 0.45f * ty * dir))
++            shineShader?.setLocalMatrix(shineMatrix)
++            canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), shinePaint)
++        }
++    }
++
++    private fun ensureOverlays(w: Int, h: Int) {
++        if (w == lastW && h == lastH) return
++        lastW = w
++        lastH = h
++        val r = max(w, h) * 0.75f
++        val shine = RadialGradient(
++            0f, 0f, r,
++            intArrayOf(Color.argb(70, 255, 255, 255), Color.argb(18, 255, 255, 255), Color.argb(0, 255, 255, 255)),
++            floatArrayOf(0f, 0.45f, 1f), Shader.TileMode.CLAMP
++        )
++        shineShader = shine
++        shinePaint.shader = shine
++        vignettePaint.shader = RadialGradient(
++            w / 2f, h / 2f, r,
++            intArrayOf(Color.argb(0, 0, 0, 0), Color.argb(0, 0, 0, 0), Color.argb(140, 0, 0, 0)),
++            floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
++        )
++    }
++}
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/ParallaxView.kt b/app/src/main/java/com/jaydeep/depthmotion/ParallaxView.kt
+new file mode 100644
+index 0000000..ce56c9e
+--- /dev/null
++++ b/app/src/main/java/com/jaydeep/depthmotion/ParallaxView.kt
+@@ -0,0 +1,132 @@
++package com.jaydeep.depthmotion
++
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.view.Choreographer
++import android.view.GestureDetector
++import android.view.MotionEvent
++import android.view.View
++import java.util.concurrent.Executors
++import kotlin.math.abs
++import kotlin.math.min
++
++/** Full-screen photo view that renders at display refresh rate with spring-smoothed gyro tilt. */
++class ParallaxView(context: Context) : View(context), Choreographer.FrameCallback {
++    val settings = RenderSettings.load(context)
++    var onSwipe: ((Int) -> Unit)? = null
++    var onTap: (() -> Unit)? = null
++    var onDoubleTap: (() -> Unit)? = null
++
++    private val tilt = TiltSensor(context)
++    private val renderer = ParallaxRenderer()
++    private val loader = Executors.newSingleThreadExecutor()
++    private var photo: Photo? = null
++    private var prev: Photo? = null
++    private var fade = 1f
++    private var token = 0
++    private var running = false
++    private var lastNanos = 0L
++    private val hint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        color = Color.argb(180, 255, 255, 255)
++        textAlign = Paint.Align.CENTER
++        textSize = 16f * resources.displayMetrics.density
++    }
++
++    private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
++        override fun onDown(e: MotionEvent): Boolean = true
++        override fun onSingleTapConfirmed(e: MotionEvent): Boolean { onTap?.invoke(); return true }
++        override fun onDoubleTap(e: MotionEvent): Boolean { onDoubleTap?.invoke(); return true }
++        override fun onFling(e1: MotionEvent, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
++            if (abs(velocityX) > 900f && abs(velocityX) > abs(velocityY) * 1.2f) {
++                onSwipe?.invoke(if (velocityX < 0f) 1 else -1)
++                return true
++            }
++            return false
++        }
++    })
++
++    init {
++        tilt.idleFloat = settings.idleFloat
++    }
++
++    fun applySettings() {
++        val fresh = RenderSettings.load(context)
++        settings.sensitivity = fresh.sensitivity
++        settings.style = fresh.style
++        settings.shine = fresh.shine
++        settings.invert = fresh.invert
++        settings.idleFloat = fresh.idleFloat
++        tilt.idleFloat = fresh.idleFloat
++    }
++
++    fun showPhoto(uri: String?) {
++        val mine = ++token
++        if (uri == null) {
++            prev = null; photo = null; invalidate(); return
++        }
++        loader.execute {
++            val bmp = BitmapLoader.load(context, uri, 2048)
++            val p = bmp?.let { Photo(it) }
++            post {
++                if (mine == token && p != null) {
++                    prev = photo
++                    photo = p
++                    fade = if (prev == null) 1f else 0f
++                    invalidate()
++                }
++            }
++        }
++    }
++
++    fun resume() {
++        if (running) return
++        running = true
++        lastNanos = 0L
++        tilt.start()
++        Choreographer.getInstance().postFrameCallback(this)
++    }
++
++    fun pause() {
++        running = false
++        tilt.stop()
++        Choreographer.getInstance().removeFrameCallback(this)
++    }
++
++    fun release() {
++        pause()
++        loader.shutdownNow()
++    }
++
++    override fun doFrame(frameTimeNanos: Long) {
++        if (!running) return
++        val dt = if (lastNanos == 0L) 0.016f else (frameTimeNanos - lastNanos) / 1e9f
++        lastNanos = frameTimeNanos
++        tilt.step(dt)
++        if (fade < 1f) {
++            fade = min(1f, fade + dt / 0.6f)
++            if (fade >= 1f) prev = null
++        }
++        invalidate()
++        Choreographer.getInstance().postFrameCallback(this)
++    }
++
++    override fun onDraw(canvas: Canvas) {
++        canvas.drawColor(Color.rgb(17, 16, 27))
++        val w = width
++        val h = height
++        val cur = photo
++        if (cur == null) {
++            canvas.drawText("Add photos in DepthMotion", w / 2f, h / 2f, hint)
++            return
++        }
++        val old = prev
++        if (old != null && fade < 1f) renderer.draw(canvas, old, w, h, tilt.x, tilt.y, settings, 255)
++        val eased = fade * fade * (3f - 2f * fade)
++        renderer.draw(canvas, cur, w, h, tilt.x, tilt.y, settings, (255 * eased).toInt())
++        renderer.drawOverlays(canvas, w, h, tilt.x, tilt.y, settings)
++    }
++
++    override fun onTouchEvent(event: MotionEvent): Boolean = gestures.onTouchEvent(event)
++}
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/PhotoStore.kt b/app/src/main/java/com/jaydeep/depthmotion/PhotoStore.kt
+index 5b5118e..33becc6 100644
+--- a/app/src/main/java/com/jaydeep/depthmotion/PhotoStore.kt
++++ b/app/src/main/java/com/jaydeep/depthmotion/PhotoStore.kt
+@@ -49,7 +49,6 @@ object PhotoStore {
+         if (prefs(c).getInt(INDEX, 0) >= list.size) prefs(c).edit().putInt(INDEX, 0).apply()
+     }
+     fun next(c: Context): String? {
+-        discover(c)
+         val list = photos(c)
+         if (list.isEmpty()) return null
+         val p = prefs(c)
+@@ -63,6 +62,27 @@ object PhotoStore {
+         p.edit().putInt(INDEX, next).apply()
+         return list[next]
+     }
++    fun step(c: Context, delta: Int): String? {
++        val list = photos(c)
++        if (list.isEmpty()) return null
++        val p = prefs(c)
++        val cur = p.getInt(INDEX, 0).coerceIn(0, list.lastIndex)
++        val n = ((cur + delta) % list.size + list.size) % list.size
++        p.edit().putInt(INDEX, n).apply()
++        return list[n]
++    }
++    fun position(c: Context): Pair<Int, Int> {
++        val list = photos(c)
++        if (list.isEmpty()) return Pair(0, 0)
++        return Pair(prefs(c).getInt(INDEX, 0).coerceIn(0, list.lastIndex) + 1, list.size)
++    }
++    fun clear(c: Context) {
++        prefs(c).edit().remove(TREE).putString(PHOTOS, "[]").putInt(INDEX, 0).apply()
++        bump(c)
++    }
++    /** Counter that changes whenever the widget picture changes, cheap to poll. */
++    fun version(c: Context): Int = prefs(c).getInt("version", 0)
++    fun bump(c: Context) { prefs(c).edit().putInt("version", version(c) + 1).apply() }
+     fun current(c: Context): String? {
+         val list = photos(c)
+         if (list.isEmpty()) return null
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/RotateWorker.kt b/app/src/main/java/com/jaydeep/depthmotion/RotateWorker.kt
+index bb36b73..5e60087 100644
+--- a/app/src/main/java/com/jaydeep/depthmotion/RotateWorker.kt
++++ b/app/src/main/java/com/jaydeep/depthmotion/RotateWorker.kt
+@@ -1,7 +1,5 @@
+ package com.jaydeep.depthmotion
+ 
+-import android.appwidget.AppWidgetManager
+-import android.content.ComponentName
+ import android.content.Context
+ import androidx.work.CoroutineWorker
+ import androidx.work.WorkerParameters
+@@ -10,9 +8,7 @@ class RotateWorker(context: Context, params: WorkerParameters) : CoroutineWorker
+     override suspend fun doWork(): Result {
+         return try {
+             PhotoStore.discover(applicationContext)
+-            val manager = AppWidgetManager.getInstance(applicationContext)
+-            manager.getAppWidgetIds(ComponentName(applicationContext, DepthMotionWidget::class.java))
+-                .forEach { DepthMotionWidget.update(applicationContext, manager, it, advance = true) }
++            DepthMotionWidget.refreshAll(applicationContext, advance = true)
+             Result.success()
+         } catch (_: Exception) { Result.retry() }
+     }
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/SettingsActivity.kt b/app/src/main/java/com/jaydeep/depthmotion/SettingsActivity.kt
+index 4cc6797..6791c93 100644
+--- a/app/src/main/java/com/jaydeep/depthmotion/SettingsActivity.kt
++++ b/app/src/main/java/com/jaydeep/depthmotion/SettingsActivity.kt
+@@ -1,7 +1,7 @@
+ package com.jaydeep.depthmotion
+ 
+ import android.Manifest
+-import android.appwidget.AppWidgetManager
++import android.app.WallpaperManager
+ import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
+@@ -44,6 +44,22 @@ class SettingsActivity : AppCompatActivity() {
+         }
+     }
+ 
++    private val motionListener: CompoundButton.OnCheckedChangeListener = CompoundButton.OnCheckedChangeListener { _, checked ->
++        if (checked) {
++            if (!TiltSensor.isSupported(this)) {
++                motionSwitch.setOnCheckedChangeListener(null)
++                motionSwitch.isChecked = false
++                motionSwitch.setOnCheckedChangeListener(motionListener)
++                toast("No compatible motion sensor was found.")
++            } else if (Build.VERSION.SDK_INT >= 33) {
++                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
++            } else startMotion()
++        } else {
++            GyroMotionService.stop(this)
++            motionStatus.text = "Off · saves battery"
++        }
++    }
++
+     private lateinit var photoCount: TextView
+     private lateinit var librarySummary: TextView
+     private lateinit var motionSwitch: Switch
+@@ -106,6 +122,32 @@ class SettingsActivity : AppCompatActivity() {
+         hero.addView(preview, LinearLayout.LayoutParams(-1, dp(126)))
+         root.addView(hero)
+ 
++        root.addView(space(16))
++        val experience = card(surface, 20)
++        experience.addView(sectionTitle("EXPERIENCE", "Smooth 60 fps depth, far beyond what a widget allows."))
++        experience.addView(space(12))
++        experience.addView(actionButton("▶   Open Depth Viewer", true) { startActivity(Intent(this, DepthViewerActivity::class.java)) })
++        experience.addView(space(8))
++        experience.addView(actionButton("▣   Set as live wallpaper", false) { openWallpaperPicker() })
++        experience.addView(space(10))
++        experience.addView(text("The live wallpaper moves at full frame rate on your home screen. Double tap the wallpaper to change the photo.", 12f, muted))
++        val styleBtn = actionButton("", false) {}
++        fun styleLabel() = if (getSharedPreferences("depthmotion", 0).getInt("style", RenderSettings.STYLE_DEPTH) == RenderSettings.STYLE_DEPTH)
++            "◈   Style: Depth (3D warp)" else "◇   Style: Flat (classic slide)"
++        styleBtn.text = styleLabel()
++        styleBtn.setOnClickListener {
++            val p = getSharedPreferences("depthmotion", 0)
++            val depth = p.getInt("style", RenderSettings.STYLE_DEPTH) == RenderSettings.STYLE_DEPTH
++            p.edit().putInt("style", if (depth) RenderSettings.STYLE_FLAT else RenderSettings.STYLE_DEPTH).apply()
++            styleBtn.text = styleLabel()
++        }
++        experience.addView(space(12))
++        experience.addView(styleBtn)
++        experience.addView(prefSwitch("Shine that follows tilt", "shine", true))
++        experience.addView(prefSwitch("Gentle idle float", "float", true))
++        experience.addView(prefSwitch("Invert motion direction", "invert", false))
++        root.addView(experience)
++
+         root.addView(space(16))
+         val library = card(surface, 20)
+         library.addView(sectionTitle("PHOTO LIBRARY", "Build the collection your widget rotates through."))
+@@ -135,22 +177,7 @@ class SettingsActivity : AppCompatActivity() {
+         motionSwitch = Switch(this).apply {
+             buttonTintList = android.content.res.ColorStateList.valueOf(accent)
+             isChecked = getSharedPreferences("depthmotion", 0).getBoolean("motion_enabled", false)
+-            setOnCheckedChangeListener { _, checked ->
+-                if (checked) {
+-                    val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+-                    if (sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR) == null &&
+-                        sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) == null &&
+-                        sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) == null) {
+-                        isChecked = false
+-                        toast("No compatible motion sensor was found.")
+-                    } else if (Build.VERSION.SDK_INT >= 33) {
+-                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+-                    } else startMotion()
+-                } else {
+-                    GyroMotionService.stop(this@SettingsActivity)
+-                    motionStatus.text = "Off · saves battery"
+-                }
+-            }
++            setOnCheckedChangeListener(motionListener)
+         }
+         row.addView(motionSwitch)
+         motion.addView(row)
+@@ -221,7 +248,7 @@ class SettingsActivity : AppCompatActivity() {
+         root.addView(footer)
+         root.addView(space(12))
+         root.addView(actionButton("Clear photo library", false) {
+-            PhotoStore.save(this, emptyList())
++            PhotoStore.clear(this)
+             refreshWidgets()
+             toast("Photo list cleared")
+         })
+@@ -230,6 +257,26 @@ class SettingsActivity : AppCompatActivity() {
+         syncMotionState()
+     }
+ 
++    private fun prefSwitch(label: String, key: String, default: Boolean): Switch = Switch(this).apply {
++        text = label
++        setTextColor(Color.WHITE)
++        setPadding(0, dp(8), 0, dp(4))
++        isChecked = getSharedPreferences("depthmotion", 0).getBoolean(key, default)
++        setOnCheckedChangeListener { _, c -> getSharedPreferences("depthmotion", 0).edit().putBoolean(key, c).apply() }
++    }
++
++    private fun openWallpaperPicker() {
++        val component = ComponentName(this, DepthWallpaperService::class.java)
++        val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER)
++            .putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, component)
++        try {
++            startActivity(intent)
++        } catch (_: Exception) {
++            try { startActivity(Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER)) }
++            catch (_: Exception) { toast("Live wallpaper picker is not available on this device.") }
++        }
++    }
++
+     private fun sectionTitle(title: String, subtitle: String): View {
+         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+         box.addView(text(title, 11f, accent, true).apply { letterSpacing = .12f })
+@@ -287,12 +334,7 @@ class SettingsActivity : AppCompatActivity() {
+         if (::motionSwitch.isInitialized && motionSwitch.isChecked != enabled) {
+             motionSwitch.setOnCheckedChangeListener(null)
+             motionSwitch.isChecked = enabled
+-            motionSwitch.setOnCheckedChangeListener { _, checked ->
+-                if (checked) {
+-                    if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+-                    else startMotion()
+-                } else GyroMotionService.stop(this)
+-            }
++            motionSwitch.setOnCheckedChangeListener(motionListener)
+         }
+         if (::motionStatus.isInitialized) motionStatus.text = if (enabled) "On · widget follows device tilt" else "Off · saves battery"
+     }
+@@ -303,10 +345,7 @@ class SettingsActivity : AppCompatActivity() {
+     }
+     private fun refreshWidgets(advance: Boolean = false) {
+         updateLibrary()
+-        val manager = AppWidgetManager.getInstance(this)
+-        manager.getAppWidgetIds(ComponentName(this, DepthMotionWidget::class.java)).forEach {
+-            DepthMotionWidget.update(this, manager, it, advance)
+-        }
++        DepthMotionWidget.refreshAll(this, advance)
+     }
+     private fun scheduleRotation() {
+         val request = PeriodicWorkRequestBuilder<RotateWorker>(PhotoStore.interval(this), TimeUnit.MINUTES).build()
+diff --git a/app/src/main/java/com/jaydeep/depthmotion/TiltSensor.kt b/app/src/main/java/com/jaydeep/depthmotion/TiltSensor.kt
+new file mode 100644
+index 0000000..cdc41ac
+--- /dev/null
++++ b/app/src/main/java/com/jaydeep/depthmotion/TiltSensor.kt
+@@ -0,0 +1,170 @@
++package com.jaydeep.depthmotion
++
++import android.content.Context
++import android.hardware.Sensor
++import android.hardware.SensorEvent
++import android.hardware.SensorEventListener
++import android.hardware.SensorManager
++import android.hardware.display.DisplayManager
++import android.view.Display
++import android.view.Surface
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.asin
++import kotlin.math.atan2
++import kotlin.math.cos
++import kotlin.math.exp
++import kotlin.math.min
++import kotlin.math.sin
++import kotlin.math.sqrt
++
++/**
++ * Turns gyroscope (or accelerometer) data into a smooth tilt value in -1..1 on both axes.
++ * Gyro rate is integrated with a leak, so drift never builds up and the photo settles back to centre.
++ * A critically damped spring removes sensor jitter.
++ */
++class TiltSensor(private val context: Context) : SensorEventListener {
++    private val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
++    private val gyro: Sensor? = manager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
++    private val accel: Sensor? = if (gyro == null) manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) else null
++
++    val hasMotionSensor: Boolean get() = gyro != null || accel != null
++
++    var x = 0f
++        private set
++    var y = 0f
++        private set
++    var idleFloat = true
++
++    private var vx = 0f
++    private var vy = 0f
++    private var targetX = 0f
++    private var targetY = 0f
++    private var angleH = 0f
++    private var angleV = 0f
++    private var lastTs = 0L
++    private var clock = 0f
++    private var running = false
++    private var rotation = Surface.ROTATION_0
++
++    private var gx = 0f
++    private var gy = 0f
++    private var gz = 0f
++    private var haveG = false
++    private var baseLean = 0f
++    private var basePitch = 0f
++    private var haveBase = false
++
++    fun start() {
++        if (running) return
++        running = true
++        lastTs = 0L
++        haveG = false
++        haveBase = false
++        refreshRotation()
++        (gyro ?: accel)?.let { manager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
++    }
++
++    fun stop() {
++        if (!running) return
++        running = false
++        manager.unregisterListener(this)
++    }
++
++    fun refreshRotation() {
++        rotation = try {
++            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
++            dm.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
++        } catch (_: Throwable) {
++            Surface.ROTATION_0
++        }
++    }
++
++    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
++
++    override fun onSensorChanged(e: SensorEvent) {
++        val dt = if (lastTs == 0L) 0f else ((e.timestamp - lastTs) / 1e9f).coerceIn(0f, 0.1f)
++        lastTs = e.timestamp
++        if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
++            if (dt == 0f) return
++            val wx = e.values[0]
++            val wy = e.values[1]
++            val h: Float
++            val v: Float
++            when (rotation) {
++                Surface.ROTATION_90 -> { h = wx; v = -wy }
++                Surface.ROTATION_180 -> { h = -wy; v = -wx }
++                Surface.ROTATION_270 -> { h = -wx; v = wy }
++                else -> { h = wy; v = wx }
++            }
++            val dh = if (abs(h) < DEADZONE) 0f else h
++            val dv = if (abs(v) < DEADZONE) 0f else v
++            val decay = exp(-dt / TAU)
++            angleH = (angleH + dh * dt) * decay
++            angleV = (angleV + dv * dt) * decay
++            targetX = (-angleH / RANGE).coerceIn(-1f, 1f)
++            targetY = (-angleV / RANGE).coerceIn(-1f, 1f)
++        } else {
++            val a = 0.12f
++            if (!haveG) {
++                gx = e.values[0]; gy = e.values[1]; gz = e.values[2]; haveG = true
++            } else {
++                gx += (e.values[0] - gx) * a
++                gy += (e.values[1] - gy) * a
++                gz += (e.values[2] - gz) * a
++            }
++            val n = sqrt(gx * gx + gy * gy + gz * gz)
++            if (n < 1f) return
++            val lean = asin((gx / n).coerceIn(-1f, 1f))
++            val pitch = atan2(gz / n, gy / n)
++            if (!haveBase) {
++                baseLean = lean; basePitch = pitch; haveBase = true
++            }
++            val k = if (dt > 0f) 1f - exp(-dt / 3f) else 0f
++            baseLean += (lean - baseLean) * k
++            basePitch += wrap(pitch - basePitch) * k
++            targetX = ((lean - baseLean) / RANGE).coerceIn(-1f, 1f)
++            targetY = (wrap(pitch - basePitch) / RANGE).coerceIn(-1f, 1f)
++        }
++    }
++
++    /** Advance the spring. Call once per frame with the frame time in seconds. */
++    fun step(dtRaw: Float) {
++        val dt = dtRaw.coerceIn(0f, 0.25f)
++        clock += dt
++        val amp = if (idleFloat) (if (hasMotionSensor) 1f else 2.2f) else 0f
++        val tx = (targetX + sin(clock * 0.7f) * 0.22f * amp).coerceIn(-1f, 1f)
++        val ty = (targetY + cos(clock * 0.53f) * 0.16f * amp).coerceIn(-1f, 1f)
++        var left = dt
++        while (left > 0f) {
++            val h = min(left, 1f / 120f)
++            vx += (STIFFNESS * (tx - x) - DAMPING * vx) * h
++            vy += (STIFFNESS * (ty - y) - DAMPING * vy) * h
++            x += vx * h
++            y += vy * h
++            left -= h
++        }
++    }
++
++    private fun wrap(a: Float): Float {
++        var r = a
++        val twoPi = (2 * PI).toFloat()
++        while (r > PI) r -= twoPi
++        while (r < -PI) r += twoPi
++        return r
++    }
++
++    companion object {
++        private const val RANGE = 0.35f
++        private const val TAU = 2.2f
++        private const val DEADZONE = 0.012f
++        private const val STIFFNESS = 140f
++        private const val DAMPING = 20f
++
++        fun isSupported(context: Context): Boolean {
++            val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
++            return sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null ||
++                sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) != null
++        }
++    }
++}
+diff --git a/app/src/main/res/layout/widget_depthmotion.xml b/app/src/main/res/layout/widget_depthmotion.xml
+index 7b193a3..fbf6723 100644
+--- a/app/src/main/res/layout/widget_depthmotion.xml
++++ b/app/src/main/res/layout/widget_depthmotion.xml
+@@ -3,7 +3,7 @@
+     android:id="@+id/widget_root" android:layout_width="match_parent" android:layout_height="match_parent"
+     android:background="#171522" android:padding="2dp">
+     <ImageView android:id="@+id/widget_image" android:layout_width="match_parent" android:layout_height="match_parent"
+-        android:scaleType="centerCrop" android:contentDescription="DepthMotion photo"/>
++        android:layout_margin="-12dp" android:scaleType="centerCrop" android:contentDescription="DepthMotion photo"/>
+     <TextView android:id="@+id/widget_empty" android:layout_width="match_parent" android:layout_height="match_parent"
+         android:gravity="center" android:text="DEPTHMOTION\nAdd your first photos" android:textColor="#FFFFFF"
+         android:textSize="14sp" android:background="#CC171522"/>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 576736d..af2724e 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1 +1,5 @@
+-<resources><string name="app_name">DepthMotion</string><string name="widget_description">Rotating photo widget with parallax-style depth framing</string></resources>
+\ No newline at end of file
++<resources>
++    <string name="app_name">DepthMotion</string>
++    <string name="widget_description">Rotating photo widget with parallax-style depth framing</string>
++    <string name="wallpaper_description">Your photos with smooth gyroscope depth, at full frame rate</string>
++</resources>
+diff --git a/app/src/main/res/xml/depthmotion_wallpaper.xml b/app/src/main/res/xml/depthmotion_wallpaper.xml
+new file mode 100644
+index 0000000..61a1cd1
+--- /dev/null
++++ b/app/src/main/res/xml/depthmotion_wallpaper.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<wallpaper xmlns:android="http://schemas.android.com/apk/res/android"
++    android:description="@string/wallpaper_description"
++    android:settingsActivity="com.jaydeep.depthmotion.SettingsActivity" />
