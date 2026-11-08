@@ -94,7 +94,7 @@ class GyroMotionService : Service(), SensorEventListener {
             lastSensorTimestamp = event.timestamp
         }
         val now = System.currentTimeMillis()
-        if (now - lastFrame >= 220L) {
+        if (now - lastFrame >= 350L) {
             lastFrame = now
             renderWidget()
         }
@@ -103,8 +103,8 @@ class GyroMotionService : Service(), SensorEventListener {
     private fun renderWidget() {
         loadPhoto()
         val source = sourceBitmap ?: return
-        val width = 720
-        val height = 720
+        val width = 560
+        val height = 560
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(output)
         val scale = max(width.toFloat() / source.width, height.toFloat() / source.height) * 1.14f
@@ -147,6 +147,10 @@ class GyroMotionService : Service(), SensorEventListener {
         sourceBitmap = null
         loadedUri = null
         getSharedPreferences("depthmotion", 0).edit().putBoolean("motion_enabled", false).apply()
+        val manager = AppWidgetManager.getInstance(this)
+        manager.getAppWidgetIds(ComponentName(this, DepthMotionWidget::class.java)).forEach {
+            DepthMotionWidget.update(this, manager, it)
+        }
         super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
