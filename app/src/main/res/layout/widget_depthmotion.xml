@@ -5,6 +5,10 @@
     <ImageView android:id="@+id/widget_image" android:layout_width="match_parent" android:layout_height="match_parent"
         android:scaleType="centerCrop" android:contentDescription="DepthMotion photo"/>
     <TextView android:id="@+id/widget_empty" android:layout_width="match_parent" android:layout_height="match_parent"
-        android:gravity="center" android:text="DepthMotion\nTap to add photos" android:textColor="#FFFFFF"
-        android:textSize="14sp" android:background="#AA171522"/>
+        android:gravity="center" android:text="DEPTHMOTION\nAdd your first photos" android:textColor="#FFFFFF"
+        android:textSize="14sp" android:background="#CC171522"/>
+    <TextView android:id="@+id/widget_motion" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end" android:layout_margin="10dp" android:paddingHorizontal="9dp"
+        android:paddingVertical="5dp" android:text="3D MOTION" android:textColor="#FFFFFF"
+        android:textSize="9sp" android:background="#990D0B16" android:visibility="gone"/>
 </FrameLayout>
