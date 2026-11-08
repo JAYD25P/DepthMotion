@@ -38,8 +38,10 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (!granted) toast("Motion can run, but Android may hide its notification.")
-        startMotion()
+        if (granted) startMotion() else {
+            motionSwitch.isChecked = false
+            toast("Allow notifications to enable motion mode and its persistent stop control.")
+        }
     }
 
     private lateinit var photoCount: TextView
@@ -137,6 +139,7 @@ class SettingsActivity : AppCompatActivity() {
                 if (checked) {
                     val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
                     if (sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR) == null &&
+                        sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) == null &&
                         sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) == null) {
                         isChecked = false
                         toast("No compatible motion sensor was found.")
@@ -148,8 +151,25 @@ class SettingsActivity : AppCompatActivity() {
         }
         row.addView(motionSwitch)
         motion.addView(row)
-        motion.addView(space(10))
-        motion.addView(text("When enabled, DepthMotion keeps a small foreground service active so it can read device orientation and refresh the widget. A persistent notification provides a stop control. This uses additional battery.", 12f, muted))
+        motion.addView(space(12))
+        val sensitivityLabel = text("Motion sensitivity · ${getSharedPreferences("depthmotion", 0).getInt("sensitivity", 55)}%", 12f, muted)
+        motion.addView(sensitivityLabel)
+        val sensitivity = SeekBar(this).apply {
+            max = 100
+            progress = getSharedPreferences("depthmotion", 0).getInt("sensitivity", 55)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val value = progress.coerceAtLeast(10)
+                    sensitivityLabel.text = "Motion sensitivity · $value%"
+                    getSharedPreferences("depthmotion", 0).edit().putInt("sensitivity", value).apply()
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        motion.addView(sensitivity)
+        motion.addView(space(8))
+        motion.addView(text("When enabled, DepthMotion keeps a foreground service active to read device orientation and refresh the widget. A persistent notification provides a stop control. Frequent image updates use additional battery and may be rate-limited by some launchers.", 12f, muted))
         root.addView(motion)
 
         root.addView(space(16))
