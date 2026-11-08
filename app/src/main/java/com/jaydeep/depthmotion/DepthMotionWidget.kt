@@ -42,16 +42,15 @@ class DepthMotionWidget : AppWidgetProvider() {
                 val uri = Uri.parse(raw)
                 val source = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
                 if (source != null) {
-                    val framed = parallaxFrame(source, context)
+                    val framed = parallaxFrame(source)
                     views.setImageViewBitmap(R.id.widget_image, framed)
                     views.setViewVisibility(R.id.widget_image, android.view.View.VISIBLE)
                     views.setViewVisibility(R.id.widget_empty, android.view.View.GONE)
-                    if (framed !== source) { framed.recycle(); source.recycle() }
                 }
             } catch (_: Exception) { }
             manager.updateAppWidget(id, views)
         }
-        private fun parallaxFrame(source: Bitmap, context: Context): Bitmap {
+        private fun parallaxFrame(source: Bitmap): Bitmap {
             val w = 900
             val h = 900
             val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
