@@ -8,6 +8,9 @@ on:
       - '*.gradle.kts'
       - 'gradle.properties'
       - '.github/workflows/android.yml'
+concurrency:
+  group: depthmotion-android-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
   actions: read
