@@ -146,7 +146,10 @@ class SettingsActivity : AppCompatActivity() {
                     } else if (Build.VERSION.SDK_INT >= 33) {
                         notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                     } else startMotion()
-                } else GyroMotionService.stop(this@SettingsActivity)
+                } else {
+                    GyroMotionService.stop(this@SettingsActivity)
+                    motionStatus.text = "Off · saves battery"
+                }
             }
         }
         row.addView(motionSwitch)
