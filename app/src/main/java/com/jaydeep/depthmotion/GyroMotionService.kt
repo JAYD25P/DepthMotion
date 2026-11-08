@@ -108,8 +108,9 @@ class GyroMotionService : Service(), SensorEventListener {
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(output)
         val scale = max(width.toFloat() / source.width, height.toFloat() / source.height) * 1.14f
-        val dx = roll * width * 0.035f
-        val dy = pitch * height * 0.035f
+        val sensitivity = getSharedPreferences("depthmotion", 0).getInt("sensitivity", 55).coerceIn(10, 100) / 55f
+        val dx = roll * width * 0.035f * sensitivity
+        val dy = pitch * height * 0.035f * sensitivity
         val matrix = Matrix().apply {
             setScale(scale, scale)
             postTranslate((width - source.width * scale) / 2f + dx,
