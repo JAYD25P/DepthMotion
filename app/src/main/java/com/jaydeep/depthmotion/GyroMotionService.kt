@@ -28,6 +28,8 @@ class GyroMotionService : Service(), SensorEventListener {
     private var orientationSensor: Sensor? = null
     private var sourceBitmap: Bitmap? = null
     private var lastFrame = 0L
+    private var lastSensorTimestamp = 0L
+    private var loadedUri: String? = null
     private var roll = 0f
     private var pitch = 0f
 
@@ -56,28 +58,41 @@ class GyroMotionService : Service(), SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         orientationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
             ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         orientationSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         loadPhoto()
     }
 
     private fun loadPhoto() {
+        val raw = PhotoStore.current(this)
+        if (raw == loadedUri && sourceBitmap != null) return
         sourceBitmap?.recycle()
+        loadedUri = raw
         sourceBitmap = try {
-            PhotoStore.current(this)?.let { raw ->
-                contentResolver.openInputStream(android.net.Uri.parse(raw))?.use { BitmapFactory.decodeStream(it) }
+            raw?.let { uri ->
+                contentResolver.openInputStream(android.net.Uri.parse(uri))?.use { BitmapFactory.decodeStream(it) }
             }
         } catch (_: Exception) { null }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_GAME_ROTATION_VECTOR && event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
-        val matrix = FloatArray(9)
-        val angles = FloatArray(3)
-        SensorManager.getRotationMatrixFromVector(matrix, event.values)
-        SensorManager.getOrientation(matrix, angles)
-        // Convert radians into a restrained, stable home-screen image offset.
-        roll = (angles[2] / 0.55f).coerceIn(-1f, 1f)
-        pitch = (angles[1] / 0.55f).coerceIn(-1f, 1f)
+        if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
+            if (lastSensorTimestamp != 0L) {
+                val dt = (event.timestamp - lastSensorTimestamp) / 1_000_000_000f
+                roll = (roll + event.values[1] * dt * 0.85f).coerceIn(-1f, 1f)
+                pitch = (pitch + event.values[0] * dt * 0.85f).coerceIn(-1f, 1f)
+            }
+            lastSensorTimestamp = event.timestamp
+        } else {
+            val matrix = FloatArray(9)
+            val angles = FloatArray(3)
+            SensorManager.getRotationMatrixFromVector(matrix, event.values)
+            SensorManager.getOrientation(matrix, angles)
+            // Fused game rotation vector avoids unbounded gyro drift on supported phones.
+            roll = (angles[2] / 0.55f).coerceIn(-1f, 1f)
+            pitch = (angles[1] / 0.55f).coerceIn(-1f, 1f)
+            lastSensorTimestamp = event.timestamp
+        }
         val now = System.currentTimeMillis()
         if (now - lastFrame >= 220L) {
             lastFrame = now
@@ -86,7 +101,8 @@ class GyroMotionService : Service(), SensorEventListener {
     }
 
     private fun renderWidget() {
-        val source = sourceBitmap ?: run { loadPhoto(); sourceBitmap } ?: return
+        loadPhoto()
+        val source = sourceBitmap ?: return
         val width = 720
         val height = 720
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -128,6 +144,7 @@ class GyroMotionService : Service(), SensorEventListener {
         sensorManager.unregisterListener(this)
         sourceBitmap?.recycle()
         sourceBitmap = null
+        loadedUri = null
         getSharedPreferences("depthmotion", 0).edit().putBoolean("motion_enabled", false).apply()
         super.onDestroy()
     }
